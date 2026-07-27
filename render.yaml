@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: mcp-drivetech
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: MCP_TRANSPORT=http MCP_HOST=0.0.0.0 python server.py
+    envVars:
+      - key: QUOTATIONS_API_URL
+        value: https://quotations-app.onrender.com
+      - key: QUOTATIONS_TIMEOUT
+        value: "60"
