@@ -96,6 +96,22 @@ def health() -> dict:
 
 
 @mcp.tool()
+def suggested_questions() -> dict:
+    """Starter questions a user can ask THIS MCP — the client renders them as
+    tappable chips. Read-only, no args. Each MCP defines its own suggestions here,
+    so the client never has to hardcode them (any new MCP is self-describing)."""
+    return {"suggestions": [
+        "What's the total pipeline value?",
+        "How many quotations do we have?",
+        "Who has the most quotations?",
+        "Show quotations for a company",
+        "Which quotations are assigned to a person?",
+        "List all draft quotations",
+        "Show a quotation by its number",
+    ]}
+
+
+@mcp.tool()
 def list_quotations() -> dict:
     """List all quotations (summary fields). Read-only.
     Returns id, number, date, status, assignee, customer, and total for each."""
