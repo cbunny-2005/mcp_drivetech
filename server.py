@@ -97,18 +97,54 @@ def health() -> dict:
 
 @mcp.tool()
 def suggested_questions() -> dict:
-    """Starter questions a user can ask THIS MCP — the client renders them as
-    tappable chips. Read-only, no args. Each MCP defines its own suggestions here,
-    so the client never has to hardcode them (any new MCP is self-describing)."""
-    return {"suggestions": [
+    """DATA-DRIVEN starter questions — built at call time from the ACTUAL quotation
+    data (real company names, assignees, statuses, counts), so the chips reflect
+    what's really in the system right now. Read-only. Falls back to a couple of
+    generic prompts if there's no data yet."""
+    try:
+        rows = _get("/api/quotations") or []
+    except Exception:
+        rows = []
+    if not rows:
+        return {"suggestions": [
+            "How many quotations do we have?",
+            "What's the total pipeline value?",
+        ]}
+
+    companies, assignees, statuses = [], [], {}
+    for q in rows:
+        c = (q.get("to") or {}).get("companyName")
+        if c and c not in companies:
+            companies.append(c)
+        a = (q.get("assignee") or {}).get("name")
+        if a and a not in assignees:
+            assignees.append(a)
+        s = q.get("status") or "draft"
+        statuses[s] = statuses.get(s, 0) + 1
+
+    sugg = [
         "What's the total pipeline value?",
-        "How many quotations do we have?",
-        "Who has the most quotations?",
-        "Show quotations for a company",
-        "Which quotations are assigned to a person?",
-        "List all draft quotations",
-        "Show a quotation by its number",
-    ]}
+        f"How many quotations do we have? ({len(rows)})",
+    ]
+    if len(assignees) > 1:
+        sugg.append("Who has the most quotations?")
+    # Real company names → tailored chips
+    for c in companies[:2]:
+        sugg.append(f"Show quotations for {c}")
+    # Real assignee → tailored chip
+    if assignees:
+        sugg.append(f"Which quotations are assigned to {assignees[0]}?")
+    # Most common status → tailored chip
+    if statuses:
+        top = max(statuses, key=statuses.get)
+        sugg.append(f"List all {top} quotations ({statuses[top]})")
+
+    # de-dupe, keep order, cap
+    seen, out = set(), []
+    for s in sugg:
+        if s not in seen:
+            seen.add(s); out.append(s)
+    return {"suggestions": out[:8]}
 
 
 @mcp.tool()
