@@ -96,6 +96,39 @@ def health() -> dict:
 
 
 @mcp.tool()
+def business_context() -> dict:
+    """Business profile for THIS MCP/org. The client shows `short` in the info box,
+    `details` under 'Know more', and loads `system_instructions` into the agent so
+    it behaves as this business's assistant. Each MCP owns its own profile → new
+    business = new MCP, no client change."""
+    return {
+        "business": "Drive Tech Engineering",
+        "short": ("Drive Tech Engineering — industrial SS pipes, fittings & valves. "
+                  "Ask me about your quotations: totals, who owns what, or a "
+                  "specific customer."),
+        "details": ("I'm Drive Tech Engineering's quotations assistant. I can look up "
+                    "any quotation, tell you the total pipeline value, show what's "
+                    "assigned to whom, and pull up a customer's or quotation-number's "
+                    "details. Prices come only from the price list — never invented."),
+        "capabilities": [
+            "Look up any quotation by number or company",
+            "Total pipeline value & counts",
+            "See who a quotation is assigned to",
+        ],
+        "getting_started": [
+            "Ask: what's the total pipeline value?",
+            "Ask: show quotations for <company>",
+        ],
+        "system_instructions": (
+            "You are Drive Tech Engineering's quotations assistant. Drive Tech "
+            "supplies industrial stainless-steel pipes, fittings, valves and gaskets. "
+            "Help with quotation lookups, totals, and assignments. Prices/part "
+            "numbers come only from the data — never invent them."
+        ),
+    }
+
+
+@mcp.tool()
 def suggested_questions() -> dict:
     """DATA-DRIVEN starter questions — built at call time from the ACTUAL quotation
     data (real company names, assignees, statuses, counts), so the chips reflect
