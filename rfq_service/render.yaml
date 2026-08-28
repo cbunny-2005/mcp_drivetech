@@ -1,0 +1,31 @@
+services:
+  - type: worker
+    name: drivetech-rfq-worker
+    runtime: python
+    plan: free
+    rootDir: rfq_service
+    buildCommand: pip install -r requirements.txt
+    startCommand: python rfq_worker.py
+    envVars:
+      - key: OSCAR_API_URL
+        sync: false
+      - key: OSCAR_INTERNAL_SECRET
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: GMAIL_CLIENT_ID
+        sync: false
+      - key: GMAIL_CLIENT_SECRET
+        sync: false
+      - key: GMAIL_REFRESH_TOKEN
+        sync: false
+      - key: RFQ_TEAM_LEAD_USER_ID
+        sync: false
+      - key: RFQ_ORG_TEAM_ID
+        sync: false
+      - key: RFQ_POLLER_INTERVAL_SEC
+        value: "120"
+      - key: RFQ_POLLER_MAX_RESULTS
+        value: "10"
+      - key: RFQ_TASK_DUE_HOURS
+        value: "24"
