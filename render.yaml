@@ -10,3 +10,5 @@ services:
         value: https://quotations-app.onrender.com
       - key: QUOTATIONS_TIMEOUT
         value: "60"
+      - key: MCP_API_KEY
+        sync: false

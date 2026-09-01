@@ -110,11 +110,9 @@ def process_email(email: dict, mark_processed: bool = True,
             oscar_client.patch_rfq_request(rfq_id, matched_json=lines, status="needs_review")
             task_id = None
             if create_task:
-                task = _create_task(ext, rfq_id, lines, quotation=None,
-                                    actor_user_id=actor_user_id)
-                _post_first_comment(task, quotation=None, lines=lines)
-                task_id = task["id"]
-                oscar_client.patch_rfq_request(rfq_id, oscar_task_id=task_id)
+                task_id = _create_task_or_flag(
+                    ext, rfq_id, lines, quotation=None, actor_user_id=actor_user_id,
+                    base_status="needs_review", gmid=gmid)
             if mark_processed:
                 _safe_mark(gmid)
             return {"status": "needs_review", "rfq_id": rfq_id, "task_id": task_id,
@@ -139,14 +137,16 @@ def process_email(email: dict, mark_processed: bool = True,
             logger.warning("[RFQ] assignee stamp 'Oscar AI' failed for %s: %s",
                            resp.get("quotationNumber"), _e)
 
-        # 6) Oscar task + comment #1 (skipped on the chat/agent path)
+        # 6) Oscar task + comment #1 (skipped on the chat/agent path). A billable
+        # quotation already exists at this point — a task-creation failure below
+        # must NOT be allowed to fall into the generic except and get the row
+        # overwritten to status="error", which would orphan it (see
+        # _create_task_or_flag).
         task_id = None
         if create_task:
-            task = _create_task(ext, rfq_id, lines, quotation=resp,
-                                actor_user_id=actor_user_id)
-            task_id = task["id"]
-            oscar_client.patch_rfq_request(rfq_id, oscar_task_id=task_id)
-            _post_first_comment(task, quotation=resp, lines=lines)
+            task_id = _create_task_or_flag(
+                ext, rfq_id, lines, quotation=resp, actor_user_id=actor_user_id,
+                base_status="quoted", gmid=gmid)
 
         if mark_processed:
             _safe_mark(gmid)
@@ -196,6 +196,37 @@ def _existing_summary(existing: dict) -> dict:
 
 
 # ── Task + comment builders ─────────────────────────────────────────────────
+def _create_task_or_flag(ext: RfqExtraction, rfq_id: int, lines: list, quotation,
+                         actor_user_id, base_status: str, gmid: str) -> int | None:
+    """Create the Oscar task + first comment for an already-recorded rfq row.
+
+    `base_status` (already patched onto the row before this runs — 'quoted' or
+    'needs_review') must survive a task-creation failure: a quotation may
+    already be live at this point, so we must not let the caller's generic
+    except overwrite the row to status='error' and orphan it. On failure this
+    bumps attempt_count (the existing retry signal) and returns None instead
+    of raising.
+    """
+    try:
+        task = _create_task(ext, rfq_id, lines, quotation=quotation,
+                            actor_user_id=actor_user_id)
+        oscar_client.patch_rfq_request(rfq_id, oscar_task_id=task["id"])
+        _post_first_comment(task, quotation=quotation, lines=lines)
+        return task["id"]
+    except Exception as e:
+        logger.error(
+            "[RFQ] task creation failed for rfq_id=%s (status stays '%s', not "
+            "overwritten to 'error'): %s", rfq_id, base_status, e, exc_info=True)
+        try:
+            current = oscar_client.get_rfq_request(gmid)
+            attempt = (current.get("attempt_count") or 0) + 1 if current else 1
+            oscar_client.patch_rfq_request(rfq_id, attempt_count=attempt)
+        except OscarApiError as patch_err:
+            logger.error("[RFQ] failed to bump attempt_count for rfq_id=%s: %s",
+                        rfq_id, patch_err)
+        return None
+
+
 def _create_task(ext: RfqExtraction, rfq_id: int, lines: list, quotation,
                  actor_user_id=None) -> dict:
     lead = resolve_team_lead(actor_user_id)

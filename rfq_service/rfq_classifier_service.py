@@ -12,12 +12,23 @@ the Team Lead reviews the generated quotation. Confidence is stored for audit on
 
 import json
 import logging
+import os
 
 from openai import OpenAI
 from rfq_schemas import RfqClassification
 
 logger = logging.getLogger(__name__)
-_client = OpenAI()
+_client = None
+
+
+def _get_client() -> OpenAI:
+    """Lazy init — constructing OpenAI() at import time would crash the whole
+    worker process before its own error handling ever runs if the API key is
+    missing/blank."""
+    global _client
+    if _client is None:
+        _client = OpenAI(timeout=float(os.getenv("OPENAI_TIMEOUT_SEC", "20")))
+    return _client
 
 # Strong negative signals — if present, almost certainly not an RFQ to quote.
 _NEGATIVE = (
@@ -64,7 +75,7 @@ def classify(subject: str, body: str, from_email: str = "") -> RfqClassification
     # Both 'accept' and 'unsure' go to the LLM — keyword presence alone is not proof.
     content = f"Subject: {subject}\n\nFrom: {from_email}\n\nBody:\n{(body or '')[:4000]}"
     try:
-        resp = _client.chat.completions.create(
+        resp = _get_client().chat.completions.create(
             model="gpt-4o-mini",
             temperature=0,
             response_format={"type": "json_object"},

@@ -37,6 +37,8 @@ def _base_url() -> str:
 
 def _headers() -> dict:
     secret = os.getenv("OSCAR_INTERNAL_SECRET", "")
+    if not secret:
+        raise EnvironmentError("OSCAR_INTERNAL_SECRET is not set")
     return {"Content-Type": "application/json", "X-Internal-Secret": secret}
 
 

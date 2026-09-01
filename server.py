@@ -26,6 +26,10 @@ Config (env)
                          cold-start ~50s, so bump for the first call if needed)
     MCP_TRANSPORT        stdio (default) | http   (http → endpoint at /mcp)
     MCP_HOST / MCP_PORT  bind for http transport (default 127.0.0.1:8200)
+    MCP_API_KEY          REQUIRED when MCP_TRANSPORT=http. Shared secret the
+                         caller must send as `Authorization: Bearer <key>` or
+                         `X-API-Key: <key>`. stdio transport doesn't need it —
+                         it's only ever wired to a local trusted process.
 
 Install
 -------
@@ -39,6 +43,7 @@ Run
 
 from __future__ import annotations
 
+import hmac
 import logging
 import os
 
@@ -50,6 +55,10 @@ logging.basicConfig(level=os.getenv("MCP_LOG_LEVEL", "INFO"))
 
 API_URL = os.getenv("QUOTATIONS_API_URL", "https://quotations-app.onrender.com").rstrip("/")
 TIMEOUT = float(os.getenv("QUOTATIONS_TIMEOUT", "30"))
+
+# One shared client for the process instead of opening a new TCP/TLS
+# connection per tool call.
+_client = httpx.Client(timeout=TIMEOUT)
 
 mcp = FastMCP(
     name="quotations-mcp",
@@ -72,10 +81,9 @@ def _api() -> str:
 
 
 def _get(path: str):
-    with httpx.Client(timeout=TIMEOUT) as c:
-        r = c.get(f"{_api()}{path}")
-        r.raise_for_status()
-        return r.json()
+    r = _client.get(f"{_api()}{path}")
+    r.raise_for_status()
+    return r.json()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -333,6 +341,42 @@ def quotation_stats() -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Auth (http transport only)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class _ApiKeyGate:
+    """Minimal shared-secret gate wrapping the streamable-http ASGI app.
+
+    FastMCP's built-in `auth=` is a full OAuth2 resource-server flow (issuer,
+    token verifier, scopes) meant for multi-tenant clients — overkill for one
+    internal MCP endpoint with a single caller, so this checks a static key
+    instead. Without this, the server was reachable by anyone who found the
+    URL (see render.yaml: MCP_HOST=0.0.0.0).
+    """
+
+    def __init__(self, app, api_key: str):
+        self._app = app
+        self._api_key = api_key
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self._app(scope, receive, send)
+            return
+        headers = dict(scope.get("headers") or [])
+        supplied = headers.get(b"x-api-key", b"").decode("latin-1")
+        if not supplied:
+            auth = headers.get(b"authorization", b"").decode("latin-1")
+            if auth.lower().startswith("bearer "):
+                supplied = auth[7:]
+        if not hmac.compare_digest(supplied, self._api_key):
+            from starlette.responses import JSONResponse
+            resp = JSONResponse({"error": "unauthorized"}, status_code=401)
+            await resp(scope, receive, send)
+            return
+        await self._app(scope, receive, send)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Entrypoint
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -340,7 +384,16 @@ def main() -> None:
     transport = os.getenv("MCP_TRANSPORT", "stdio").lower()
     logger.info("quotations-mcp → backend %s (transport=%s)", _api(), transport)
     if transport == "http":
-        mcp.run(transport="streamable-http")   # endpoint at host:port/mcp
+        api_key = os.getenv("MCP_API_KEY", "")
+        if not api_key:
+            raise EnvironmentError(
+                "MCP_API_KEY must be set when MCP_TRANSPORT=http — without it "
+                "this server exposes all quotation data to anyone who finds the URL."
+            )
+        import uvicorn
+        app = _ApiKeyGate(mcp.streamable_http_app(), api_key)
+        uvicorn.run(app, host=mcp.settings.host, port=mcp.settings.port,
+                    log_level=os.getenv("MCP_LOG_LEVEL", "info").lower())
     else:
         mcp.run()                              # stdio
 

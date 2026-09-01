@@ -18,13 +18,22 @@ LLM call (no judgment needed). The agent is invoked only for the ambiguous cases
 
 import json
 import logging
+import os
 
 from openai import OpenAI
 from rfq_schemas import RfqProduct
 import price_lookup_service
 
 logger = logging.getLogger(__name__)
-_client = OpenAI()
+_client = None
+
+
+def _get_client() -> OpenAI:
+    """Lazy init — see rfq_classifier_service._get_client() for why."""
+    global _client
+    if _client is None:
+        _client = OpenAI(timeout=float(os.getenv("OPENAI_TIMEOUT_SEC", "20")))
+    return _client
 
 _SYSTEM = """You match a customer's requested product to a supplier's industrial \
 price list (pumps, valves, gaskets, seals, heat-exchanger plates, fittings). You \
@@ -115,7 +124,7 @@ def _agent_pick(query: str, candidates: list[dict], exact_hit: bool = False):
     )
     content = f"Requested product: {query}\n\nCandidates:\n{listing}"
     try:
-        resp = _client.chat.completions.create(
+        resp = _get_client().chat.completions.create(
             model="gpt-4o-mini",
             temperature=0,
             response_format={"type": "json_object"},
