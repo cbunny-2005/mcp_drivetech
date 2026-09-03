@@ -144,7 +144,8 @@ def _check_required_env() -> None:
     """Fail fast and loud at startup instead of crashing deep in the pipeline
     (e.g. OpenAI() at import time) or silently 401ing on every Oscar call
     (a blank OSCAR_INTERNAL_SECRET)."""
-    missing = [name for name in ("OSCAR_API_URL", "OSCAR_INTERNAL_SECRET", "OPENAI_API_KEY")
+    missing = [name for name in ("OSCAR_API_URL", "OSCAR_INTERNAL_SECRET", "OPENAI_API_KEY",
+                                  "DATABASE_URL")
               if not os.getenv(name)]
     if missing:
         raise EnvironmentError(
@@ -154,11 +155,15 @@ def _check_required_env() -> None:
 def main():
     _check_required_env()
 
-    # Load price lists once up front so the first real RFQ isn't slow.
+    # Warm the DB connection and confirm the catalog was actually ingested
+    # (embed_price_lists.py) before the first real RFQ hits an empty table.
     try:
-        price_lookup_service.load_price_lists()
+        n = price_lookup_service.index_size()
+        logger.info("[RFQ-Worker] catalog ready — %d rows", n)
+        if n == 0:
+            logger.warning("[RFQ-Worker] catalog_items is EMPTY — run embed_price_lists.py")
     except Exception as e:
-        logger.error("[RFQ-Worker] price-list preload failed: %s", e)
+        logger.error("[RFQ-Worker] catalog DB check failed: %s", e)
 
     interval = _interval()
     logger.info("[RFQ-Worker] started — checking the mailbox every %ds", interval)

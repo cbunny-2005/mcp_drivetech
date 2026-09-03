@@ -22,6 +22,7 @@ import os
 
 from openai import OpenAI
 from rfq_schemas import RfqProduct
+import embedding_service
 import price_lookup_service
 
 logger = logging.getLogger(__name__)
@@ -87,12 +88,13 @@ def match_products(products: list[RfqProduct]) -> list[dict]:
 def _match_one(p: RfqProduct) -> dict:
     query = " ".join(x for x in [p.product, p.size, p.brand] if x)
     part_hint = _looks_like_part(p.product) or _looks_like_part(p.notes)
+    size_token = embedding_service.extract_size_token(p.size or p.product)
 
     # Tool call: gather real candidates (wide net so the agent has options). The
     # tool only SERVES rows — the agent always makes the final decision (no
     # deterministic fast-path; the LLM is always in the loop by design).
     res = price_lookup_service.lookup(query, part_number=part_hint,
-                                      top_k=8, fuzzy_threshold=40)
+                                      size_token=size_token, top_k=8)
     candidates = list(res.get("candidates") or [])
 
     # Ensure an exact part/description hit is on the table as the top candidate.

@@ -94,7 +94,7 @@ def main():
     ap.add_argument("--max-results", type=int, default=5)
     args = ap.parse_args()
 
-    price_lookup_service.load_price_lists()
+    print(f"[price_lookup] catalog rows in DB: {price_lookup_service.index_size()}")
 
     if args.sample:
         _run_one(_SAMPLE_EMAIL)
