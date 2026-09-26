@@ -9,6 +9,17 @@ at local dev or the live Render backend.
 MCP agent ──MCP──► server.py ──HTTP──► quotations-app backend ──► MongoDB
 ```
 
+## Other services in this repo
+
+This is one of three independently-deployable pieces that happen to share a
+git repo — no shared state, no shared process:
+
+| Path | What it is |
+|---|---|
+| `server.py` (here) | This MCP server — read-only, queries the quotations backend |
+| `rfq_service/` | Background worker: Gmail → classify/extract/match (pgvector catalog matching) → quotation → Oscar task. See `rfq_service/README.md` |
+| `demo/` | Temporary FastAPI + Streamlit UI for demoing the `rfq_service` pipeline in a browser — not part of production, delete after use. See `demo/README.md` |
+
 ## Tools
 Purpose is **conversational intelligence** — let an agent answer natural-language
 questions about quotations (counts, values, who-has-what, lookups) and take actions.

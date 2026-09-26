@@ -33,8 +33,13 @@ import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+from dotenv import load_dotenv
+load_dotenv()  # local dev: reads rfq_service/.env. No-op if the file isn't there
+               # (Render injects real env vars directly, no .env file in prod).
+
 import email_processing_service
 import gmail_service
+import oscar_client
 import price_lookup_service
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -42,6 +47,14 @@ logger = logging.getLogger("rfq-worker")
 
 _QUERY = "request for quotation OR quotation OR rfq OR enquiry"
 _IST = ZoneInfo("Asia/Kolkata")
+
+# Consecutive Gmail failures (e.g. the OAuth refresh token expiring — Google
+# expires it every 7 days while the app is in "testing" mode) used to just log
+# and keep sleeping forever with no operator-visible signal. Alert once, then
+# stay quiet until it recovers so we don't spam a notification every tick.
+_gmail_failure_streak = 0
+_GMAIL_ALERT_THRESHOLD = 3
+_gmail_alert_sent = False
 
 
 def _now():
@@ -62,14 +75,47 @@ def _max_results() -> int:
         return 10
 
 
+def _alert_gmail_down(exc: Exception) -> None:
+    """Best-effort — notify the team lead that mailbox polling is failing
+    (most commonly the OAuth refresh token expiring every 7 days while the
+    Google consent screen is in 'testing' mode) so a human finds out instead
+    of RFQs silently piling up unread with only a log line as evidence."""
+    lead_id = os.getenv("RFQ_TEAM_LEAD_USER_ID")
+    if not lead_id:
+        logger.error("[RFQ-Worker] Gmail polling is failing and no "
+                     "RFQ_TEAM_LEAD_USER_ID is set to alert — last error: %s", exc)
+        return
+    try:
+        oscar_client.send_notification(
+            int(lead_id), "system_alert",
+            f"RFQ mailbox polling has failed {_gmail_failure_streak} ticks in a "
+            f"row — likely the Gmail refresh token expired. Last error: {exc}")
+    except Exception as notify_err:
+        logger.error("[RFQ-Worker] failed to send Gmail-down alert: %s", notify_err)
+
+
 def _tick():
     """One mailbox sweep. Crash-isolated by the caller."""
+    global _gmail_failure_streak, _gmail_alert_sent
+
     if not gmail_service.is_configured():
         logger.warning("[RFQ-Worker] Gmail NOT configured (missing GMAIL_CLIENT_ID/"
                        "SECRET/REFRESH_TOKEN) — skipping tick")
         return
 
-    ids = gmail_service.list_unread(query=_QUERY, max_results=_max_results())
+    try:
+        ids = gmail_service.list_unread(query=_QUERY, max_results=_max_results())
+    except Exception as e:
+        _gmail_failure_streak += 1
+        logger.error("[RFQ-Worker] Gmail list_unread failed (streak=%d): %s",
+                    _gmail_failure_streak, e, exc_info=True)
+        if _gmail_failure_streak >= _GMAIL_ALERT_THRESHOLD and not _gmail_alert_sent:
+            _alert_gmail_down(e)
+            _gmail_alert_sent = True
+        return
+
+    _gmail_failure_streak = 0
+    _gmail_alert_sent = False
     logger.info("[RFQ-Worker] tick — Gmail OK, query matched %d email(s)", len(ids or []))
 
     new_tasks = 0
@@ -94,12 +140,30 @@ def _tick():
                new_tasks, len(ids or []))
 
 
+def _check_required_env() -> None:
+    """Fail fast and loud at startup instead of crashing deep in the pipeline
+    (e.g. OpenAI() at import time) or silently 401ing on every Oscar call
+    (a blank OSCAR_INTERNAL_SECRET)."""
+    missing = [name for name in ("OSCAR_API_URL", "OSCAR_INTERNAL_SECRET", "OPENAI_API_KEY",
+                                  "DATABASE_URL")
+              if not os.getenv(name)]
+    if missing:
+        raise EnvironmentError(
+            f"Missing required env var(s): {', '.join(missing)} — the worker cannot start.")
+
+
 def main():
-    # Load price lists once up front so the first real RFQ isn't slow.
+    _check_required_env()
+
+    # Warm the DB connection and confirm the catalog was actually ingested
+    # (embed_price_lists.py) before the first real RFQ hits an empty table.
     try:
-        price_lookup_service.load_price_lists()
+        n = price_lookup_service.index_size()
+        logger.info("[RFQ-Worker] catalog ready — %d rows", n)
+        if n == 0:
+            logger.warning("[RFQ-Worker] catalog_items is EMPTY — run embed_price_lists.py")
     except Exception as e:
-        logger.error("[RFQ-Worker] price-list preload failed: %s", e)
+        logger.error("[RFQ-Worker] catalog DB check failed: %s", e)
 
     interval = _interval()
     logger.info("[RFQ-Worker] started — checking the mailbox every %ds", interval)

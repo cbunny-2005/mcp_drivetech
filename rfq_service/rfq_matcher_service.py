@@ -18,13 +18,23 @@ LLM call (no judgment needed). The agent is invoked only for the ambiguous cases
 
 import json
 import logging
+import os
 
 from openai import OpenAI
 from rfq_schemas import RfqProduct
+import embedding_service
 import price_lookup_service
 
 logger = logging.getLogger(__name__)
-_client = OpenAI()
+_client = None
+
+
+def _get_client() -> OpenAI:
+    """Lazy init — see rfq_classifier_service._get_client() for why."""
+    global _client
+    if _client is None:
+        _client = OpenAI(timeout=float(os.getenv("OPENAI_TIMEOUT_SEC", "20")))
+    return _client
 
 _SYSTEM = """You match a customer's requested product to a supplier's industrial \
 price list (pumps, valves, gaskets, seals, heat-exchanger plates, fittings). You \
@@ -78,12 +88,13 @@ def match_products(products: list[RfqProduct]) -> list[dict]:
 def _match_one(p: RfqProduct) -> dict:
     query = " ".join(x for x in [p.product, p.size, p.brand] if x)
     part_hint = _looks_like_part(p.product) or _looks_like_part(p.notes)
+    size_token = embedding_service.extract_size_token(p.size or p.product)
 
     # Tool call: gather real candidates (wide net so the agent has options). The
     # tool only SERVES rows — the agent always makes the final decision (no
     # deterministic fast-path; the LLM is always in the loop by design).
     res = price_lookup_service.lookup(query, part_number=part_hint,
-                                      top_k=8, fuzzy_threshold=40)
+                                      size_token=size_token, top_k=8)
     candidates = list(res.get("candidates") or [])
 
     # Ensure an exact part/description hit is on the table as the top candidate.
@@ -115,7 +126,7 @@ def _agent_pick(query: str, candidates: list[dict], exact_hit: bool = False):
     )
     content = f"Requested product: {query}\n\nCandidates:\n{listing}"
     try:
-        resp = _client.chat.completions.create(
+        resp = _get_client().chat.completions.create(
             model="gpt-4o-mini",
             temperature=0,
             response_format={"type": "json_object"},

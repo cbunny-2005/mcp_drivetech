@@ -1,246 +1,216 @@
 """
-Price lookup service — deterministic matching against the supplier Excel lists.
+Price lookup service — deterministic matching against the vector-embedded
+catalog in Postgres/pgvector. This is the ONLY source of prices and part
+numbers — the LLM never prices anything. The catalog itself is populated by
+embed_price_lists.py, run manually whenever the .xlsx price lists change;
+this module only ever reads.
 
-Loads EVERY .xlsx in PRICE_LIST_excel/ once at startup into an in-memory index
-and answers lookups. This is the ONLY source of prices and part numbers — the LLM
-never prices anything. Matching cascade: exact part number → normalized
-description → fuzzy (rapidfuzz). Returns candidates + confidence; never invents.
+Matching cascade:
+  1. Exact part number       — free, deterministic, always right when it hits.
+  2. Exact normalized description — same.
+  3. Every remaining catalog row is scored directly (cosine similarity +
+     fuzzy-text score + size-token match, blended) and reranked — reached
+     only when 1-2 miss.
 
-The two shipped files have DIFFERENT schemas, so columns are mapped by HEADER
-NAME (not fixed positions):
-  File 1 (HFH, sheet Sheet2, header row 2):
-    ALSIS codes | AL Item code | Description | LPL 2026 (INR) | Anytime ordering
-  File 2 (HHT, sheet GPHE, header row 1):
-    Item code | Anytime Code | Desc | List Price - July onward |
-    DLP (40% Discount on LP) | HSN | Lead time (In weeks)
-Rate = LIST price (the DLP/discount column is intentionally ignored — MVP sends
-discount=0 and the Team Lead applies discounts while editing the quotation).
+     Why score the whole catalog instead of truncating to a top-N pool per
+     signal first: at ~2,500 rows, scoring every row is cheap, and an
+     earlier truncate-then-union design measurably dropped correct matches.
+     Two failure modes were caught by testing against real RFQ data:
+     (a) vector-only retrieval ranked a genuinely correct match ("SUPPORT
+     SECTOR" for a "GENERIC SUPPORT FOR PIPE..." request) 2456th of 2554 by
+     cosine similarity alone — terse catalog descriptions drift far from
+     long, numeric-heavy RFQ text in embedding space; (b) even after adding
+     a fuzzy leg, truncating EACH leg to its own top-N before computing the
+     blended score dropped a row ("CLAMPS AND SCREWS" for a "PH CLAMPS
+     HEAVY" request) whose blended score would have ranked it highly, because
+     it individually missed both legs' own narrow top-N cutoff — several
+     unrelated catalog rows outranked it on cosine alone, and several
+     literal-token-heavy rows outranked it on fuzzy alone, even though
+     neither alone was the better match. Scoring the full catalog before
+     ranking removes that failure mode structurally instead of tuning pool
+     widths against one fixture at a time.
+
+Returns candidates + confidence; never invents. rfq_matcher_service's LLM
+agent still makes the final type-safety judgment over whatever candidates
+this returns — this module's job is only to rank, not to decide.
 """
 
-import glob
 import logging
-import os
-import re
+import threading
+
+from pgvector import Vector
+from psycopg.rows import dict_row
+from rapidfuzz import process, fuzz
+
+import db
+import embedding_service
+from text_utils import norm_exact
 
 logger = logging.getLogger(__name__)
 
-PRICE_DIR = os.getenv("PRICE_LIST_DIR", "PRICE_LIST_excel")
+# Hybrid rerank weights — sum to 1.0. Fuzzy carries the most weight: measured
+# against this catalog (short, literal technical part names — "SUPPORT
+# SECTOR", "CLAMPS AND SCREWS", "CLAMP"), rapidfuzz.token_set_ratio was
+# consistently the more reliable signal, while cosine similarity alone
+# sometimes buried the correct match hundreds of ranks down (terse
+# descriptions drift far from long, numeric-heavy RFQ text in embedding
+# space). Vector search still earns its keep on reworded/synonym requests
+# fuzzy matching misses on its own — it's a supporting signal here, not the
+# lead one, for THIS catalog's text characteristics. Size is a smaller
+# tiebreaker signal since not every request/row has one.
+_W_VECTOR, _W_FUZZY, _W_SIZE = 0.35, 0.5, 0.15
 
-# Header keyword → canonical field. First match wins; order matters.
-_PART_KEYS = ("al item code", "item code", "anytime code", "part", "code")
-_DESC_KEYS = ("description", "desc")
-_PRICE_KEYS = ("lpl", "list price", "price", "rate")   # NOT "dlp"/"discount"
-_LEAD_KEYS = ("lead time", "delivery", "lead")
-_HSN_KEYS = ("hsn",)
+# Reported "matched" only if the top hybrid score clears this floor. Below it,
+# the pool is too weak to be worth an LLM call — same intent as the old
+# fuzzy_threshold, just measured against the hybrid score instead of rapidfuzz.
+_MATCH_FLOOR = 0.5
 
-_rows: list[dict] = []      # in-memory index of ProductRow dicts
-_loaded = False
-
-
-# ── Normalization ───────────────────────────────────────────────────────────
-def _norm(s) -> str:
-    if s is None:
-        return ""
-    s = str(s).lower().strip()
-    s = re.sub(r"[^a-z0-9 ]+", " ", s)
-    return re.sub(r"\s+", " ", s).strip()
-
-
-def _to_price(v):
-    if v is None:
-        return None
-    try:
-        return round(float(str(v).replace(",", "").strip()), 2)
-    except (ValueError, TypeError):
-        return None
+_CANDIDATE_FIELDS = ("source_file", "sheet", "part_number", "description",
+                     "price", "lead_time", "hsn", "size_token")
 
 
-def _match_header(cell: str, keys) -> bool:
-    c = _norm(cell)
-    # DLP/discount columns must never be treated as the list price.
-    if keys is _PRICE_KEYS and ("dlp" in c or "discount" in c):
-        return False
-    return any(k in c for k in keys)
-
-
-# ── Load ────────────────────────────────────────────────────────────────────
-def load_price_lists(directory: str = None) -> int:
-    """Load all .xlsx in `directory` into the in-memory index. Returns row count.
-    Idempotent — safe to call again to reload (e.g. after dropping a new file)."""
-    global _rows, _loaded
-    directory = directory or PRICE_DIR
-    import openpyxl
-
-    new_rows: list[dict] = []
-    files = sorted(glob.glob(os.path.join(directory, "*.xlsx")))
-    if not files:
-        logger.warning("[PRICE] no .xlsx found in %s", directory)
-
-    for path in files:
-        fname = os.path.basename(path)
-        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
-        file_rows = 0
-        for ws in wb.worksheets:
-            colmap, header_row_idx = _find_header(ws)
-            if not colmap or "description" not in colmap and "part_number" not in colmap:
-                continue
-            for i, row in enumerate(ws.iter_rows(values_only=True)):
-                if i <= header_row_idx:
-                    continue
-                rec = _row_to_record(row, colmap, fname, ws.title)
-                if rec is None:
-                    continue
-                new_rows.append(rec)
-                file_rows += 1
-        wb.close()
-        logger.info("[PRICE] loaded %d rows from %s", file_rows, fname)
-
-    _rows = new_rows
-    _loaded = True
-    logger.info("[PRICE] index ready: %d rows from %d file(s)", len(_rows), len(files))
-    return len(_rows)
-
-
-def _best_column(cells, keys):
-    """Pick the column whose header matches the MOST SPECIFIC keyword (earliest in
-    `keys`, which is ordered most-specific-first). Prevents 'ALSIS codes' (matches
-    generic 'code') from beating 'AL Item code' (matches 'al item code')."""
-    best_idx, best_rank = None, len(keys)
-    for idx, cell in enumerate(cells):
-        c = _norm(cell)
-        if not c:
-            continue
-        if keys is _PRICE_KEYS and ("dlp" in c or "discount" in c):
-            continue
-        for rank, k in enumerate(keys):
-            if k in c and rank < best_rank:
-                best_idx, best_rank = idx, rank
-                break
-    return best_idx
-
-
-def _find_header(ws):
-    """Scan the first ~8 rows for the header row; return (colmap, header_row_idx).
-    colmap maps canonical field → column index (best/most-specific header per field)."""
-    for i, row in enumerate(ws.iter_rows(values_only=True)):
-        if i > 8:
-            break
-        cells = [("" if c is None else str(c)) for c in row]
-        if not any(cells):
-            continue
-        colmap = {}
-        for field, keys in (
-            ("part_number", _PART_KEYS), ("description", _DESC_KEYS),
-            ("price", _PRICE_KEYS), ("lead_time", _LEAD_KEYS), ("hsn", _HSN_KEYS),
-        ):
-            idx = _best_column(cells, keys)
-            if idx is not None:
-                colmap[field] = idx
-        # Two fields must not share a column (e.g. description vs part). Keep the
-        # more specific assignment; drop the collision from the looser field.
-        _dedupe_colmap(colmap, cells)
-        # A valid header row must have a description or part number AND a price.
-        if ("description" in colmap or "part_number" in colmap) and "price" in colmap:
-            return colmap, i
-    return {}, -1
-
-
-def _dedupe_colmap(colmap, cells):
-    seen = {}
-    for field in list(colmap.keys()):
-        idx = colmap[field]
-        if idx in seen:
-            # keep whichever field's header is longer/more specific; drop the other
-            other = seen[idx]
-            if len(_norm(cells[idx])) and field == "part_number":
-                del colmap[other]
-                seen[idx] = field
-            else:
-                del colmap[field]
-        else:
-            seen[idx] = field
-
-
-def _row_to_record(row, colmap, fname, sheet):
-    def cell(field):
-        idx = colmap.get(field)
-        return row[idx] if idx is not None and idx < len(row) else None
-
-    part = cell("part_number")
-    desc = cell("description")
-    if (part is None or str(part).strip() == "") and (desc is None or str(desc).strip() == ""):
-        return None  # trailing empty row (File 1 pads to ~1M rows)
-    price = _to_price(cell("price"))
-    return {
-        "source_file": fname,
-        "sheet": sheet,
-        "part_number": str(part).strip() if part is not None else None,
-        "description": str(desc).strip() if desc is not None else None,
-        "price": price,
-        "lead_time": (str(cell("lead_time")).strip() if cell("lead_time") is not None else None),
-        "hsn": (str(cell("hsn")).strip() if cell("hsn") is not None else None),
-        "_norm_desc": _norm(desc),
-        "_norm_part": _norm(part),
-    }
-
-
-# ── Lookup ──────────────────────────────────────────────────────────────────
-def lookup(query: str, part_number: str = None, top_k: int = 3,
-           fuzzy_threshold: int = 70) -> dict:
-    """Match a requested product against the price list. Deterministic.
-    Returns {matched, method, confidence, best, candidates}."""
-    if not _loaded:
-        load_price_lists()
+def lookup(query: str, part_number: str = None, size_token: str = None,
+           top_k: int = 8) -> dict:
+    """Match a requested product against the catalog. Returns
+    {matched, method, confidence, best, candidates}."""
+    conn = db.get_conn()
 
     # 1) Exact part number (highest confidence)
     if part_number:
-        npart = _norm(part_number)
-        for r in _rows:
-            if r["_norm_part"] and r["_norm_part"] == npart:
-                return _result(True, "exact_part", 1.0, r, [r])
+        npart = norm_exact(part_number)
+        row = _fetch_one(
+            conn, "SELECT * FROM catalog_items WHERE norm_part = %s LIMIT 1", (npart,))
+        if row:
+            c = _clean(row)
+            return _result(True, "exact_part", 1.0, c, [c])
 
-    nq = _norm(query)
+    nq = norm_exact(query)
     if not nq:
         return _result(False, "empty_query", 0.0, None, [])
 
     # 2) Exact normalized description
-    exact = [r for r in _rows if r["_norm_desc"] == nq]
-    if exact:
-        return _result(True, "exact_desc", 1.0, exact[0], exact[:top_k])
+    exact_rows = _fetch_all(
+        conn, "SELECT * FROM catalog_items WHERE norm_description = %s LIMIT %s",
+        (nq, top_k))
+    if exact_rows:
+        cands = [_clean(r) for r in exact_rows]
+        return _result(True, "exact_desc", 1.0, cands[0], cands)
 
-    # 3) Fuzzy over descriptions
-    try:
-        from rapidfuzz import process, fuzz
-        choices = [(idx, r["_norm_desc"]) for idx, r in enumerate(_rows) if r["_norm_desc"]]
-        # token_set_ratio handles subset queries well ("T8-M2 CH PL 316" vs the
-        # full "T8-M2 CH PL 316/0.5/HT/NBRP…") where token_sort penalizes length.
-        scored = process.extract(
-            nq, {i: d for i, d in choices},
-            scorer=fuzz.token_set_ratio, limit=top_k,
-        )
-        cands = [dict(_rows[i], _score=round(sc, 1)) for (_d, sc, i) in scored]
-    except ImportError:
-        cands = []
+    # 3) Score every catalog row: cosine similarity (vector) via SQL, fuzzy
+    # text score via rapidfuzz over the in-process index — both computed for
+    # the FULL catalog, not a truncated top-N, then blended and reranked.
+    embed_text = embedding_service.normalize_for_embedding(query)
+    qvec = Vector(embedding_service.embed(embed_text))
+    vec_rows = _fetch_all(
+        conn,
+        "SELECT id, source_file, sheet, part_number, description, "
+        "norm_description, size_token, price, lead_time, hsn, "
+        "1 - (embedding <=> %s) AS cosine_sim FROM catalog_items",
+        (qvec,))
+    if not vec_rows:
+        return _result(False, "no_match", 0.0, None, [])
 
-    if cands and cands[0].get("_score", 0) >= fuzzy_threshold:
-        conf = round(cands[0]["_score"] / 100.0, 3)
-        return _result(True, "fuzzy", conf, cands[0], cands)
-    return _result(False, "no_match", 0.0, None, cands)
+    fuzzy_by_id = {}
+    fuzzy_index = _load_fuzzy_index()
+    if fuzzy_index:
+        choices = {i: r["norm_description"] for i, r in enumerate(fuzzy_index)
+                   if r["norm_description"]}
+        hits = process.extract(nq, choices, scorer=fuzz.token_set_ratio, limit=None)
+        for _desc, score, idx in hits:
+            fuzzy_by_id[fuzzy_index[idx]["id"]] = score / 100.0
+
+    q_size = size_token or embedding_service.extract_size_token(query)
+
+    ranked = []
+    for row in vec_rows:
+        cosine = float(row["cosine_sim"])
+        fuzzy = fuzzy_by_id.get(row["id"], 0.0)
+        base_relevance = max(cosine, fuzzy)
+        size_boost = _size_match_score(q_size, row.get("size_token"))
+        # Size is a TIEBREAKER, not an independent signal — it's scaled by
+        # base_relevance so a coincidental size match (e.g. a gasket that
+        # happens to mention the same size as a requested clamp) can't
+        # outrank a genuinely relevant item that simply lacks a parsed size.
+        score = (_W_VECTOR * cosine + _W_FUZZY * fuzzy
+                 + _W_SIZE * size_boost * base_relevance)
+        ranked.append((score, row))
+    ranked.sort(key=lambda x: x[0], reverse=True)
+
+    candidates = []
+    for score, row in ranked[:top_k]:
+        c = _clean(row)
+        c["_score"] = round(score * 100, 1)
+        candidates.append(c)
+
+    top_score = candidates[0]["_score"] / 100.0
+    matched = top_score >= _MATCH_FLOOR
+    return _result(matched, "vector" if matched else "no_match",
+                   round(top_score, 3), candidates[0] if matched else None, candidates)
+
+
+def _size_match_score(q_size, row_size):
+    if not q_size:
+        return 0.5   # no size info in the request — signal is neutral, not penalizing
+    if not row_size:
+        return 0.4   # catalog row has no size token — slightly below neutral
+    return 1.0 if q_size == row_size else 0.0
+
+
+_fuzzy_index_cache = None
+_fuzzy_index_lock = threading.Lock()
+
+
+def _load_fuzzy_index():
+    """In-process cache of every catalog row's text fields, for the fuzzy
+    retrieval leg. Loaded once per process — the catalog only changes via a
+    fresh embed_price_lists.py run followed by a worker restart, same
+    lifecycle assumption the old in-memory Excel cache made."""
+    global _fuzzy_index_cache
+    with _fuzzy_index_lock:
+        if _fuzzy_index_cache is not None:
+            return _fuzzy_index_cache
+        conn = db.get_conn()
+        _fuzzy_index_cache = _fetch_all(
+            conn,
+            "SELECT id, source_file, sheet, part_number, description, "
+            "norm_description, size_token, price, lead_time, hsn FROM catalog_items",
+            ())
+        return _fuzzy_index_cache
+
+
+def _clean(row: dict) -> dict:
+    """Keep only the fields downstream code (rfq_matcher_service) uses — drop
+    id/embedding/created_at/norm_*/cosine_sim, and coerce price to float."""
+    out = {k: row.get(k) for k in _CANDIDATE_FIELDS}
+    if out.get("price") is not None:
+        out["price"] = round(float(out["price"]), 2)
+    return out
+
+
+def _fetch_one(conn, sql, params):
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(sql, params)
+        return cur.fetchone()
+
+
+def _fetch_all(conn, sql, params):
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(sql, params)
+        return cur.fetchall()
 
 
 def _result(matched, method, confidence, best, candidates):
-    def clean(r):
-        if r is None:
-            return None
-        return {k: v for k, v in r.items() if not k.startswith("_norm")}
     return {
         "matched": matched,
         "method": method,
         "confidence": confidence,
-        "best": clean(best),
-        "candidates": [clean(c) for c in candidates],
+        "best": best,
+        "candidates": candidates,
     }
 
 
 def index_size() -> int:
-    return len(_rows)
+    conn = db.get_conn()
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM catalog_items")
+        return cur.fetchone()[0]

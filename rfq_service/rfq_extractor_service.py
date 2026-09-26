@@ -11,12 +11,21 @@ Returns a validated RfqExtraction.
 
 import json
 import logging
+import os
 
 from openai import OpenAI
 from rfq_schemas import RfqExtraction, RfqProduct
 
 logger = logging.getLogger(__name__)
-_client = OpenAI()
+_client = None
+
+
+def _get_client() -> OpenAI:
+    """Lazy init — see rfq_classifier_service._get_client() for why."""
+    global _client
+    if _client is None:
+        _client = OpenAI(timeout=float(os.getenv("OPENAI_TIMEOUT_SEC", "20")))
+    return _client
 
 _SYSTEM = """You extract structured data from a Request For Quotation (RFQ) email.
 
@@ -60,7 +69,7 @@ def extract(subject: str, body: str, from_email: str = "",
     )
     content = f"{header_ctx}\n\nBody:\n{(body or '')[:6000]}"
     try:
-        resp = _client.chat.completions.create(
+        resp = _get_client().chat.completions.create(
             model="gpt-4o-mini",
             temperature=0,
             response_format={"type": "json_object"},
