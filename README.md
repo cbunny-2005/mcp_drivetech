@@ -19,6 +19,59 @@ git repo — no shared state, no shared process:
 | `server.py` (here) | This MCP server — read-only, queries the quotations backend |
 | `rfq_service/` | Background worker: Gmail → classify/extract/match (pgvector catalog matching) → quotation → Oscar task. See `rfq_service/README.md` |
 | `demo/` | Temporary FastAPI + Streamlit UI for demoing the `rfq_service` pipeline in a browser — not part of production, delete after use. See `demo/README.md` |
+| `oscar_ai_bot_legacy/` | The old on-demand "Oscar AI" DM bot + its price lists, relocated OUT of the Oscar backend on 2026-09-26. Currently **not runnable as-is** — see below. |
+
+## `oscar_ai_bot_legacy/` — the "Oscar AI" DM bot (moved 2026-09-26)
+
+**What it was:** a second, focused RFQ path inside the Oscar backend (`AlumnxAILabs_epa`), separate from
+the automatic background poller (`rfq_service/` above). A team member could DM a special "Oscar AI" account
+inside the Oscar chat app and ask "any new RFQ emails?" — the bot would check the mailbox on demand and
+reply in-chat with quotation details, instead of waiting for the background worker's own polling cycle.
+
+**Why it's here now:** all RFQ-processing code was consolidated into this repo. This folder holds every
+file that on-demand path depended on:
+
+| File | Role |
+|---|---|
+| `oscar_ai_bot.py` | The focused LangChain agent — ONE tool (`check_rfq_emails`), a narrow system prompt, nothing else bound |
+| `tools/rfq_tools.py` | The `check_rfq_emails` tool itself |
+| `services/email_processing_service.py` | Pipeline: dedup → classify → extract → match → quote → create task |
+| `services/rfq_classifier_service.py` | "Is this an RFQ?" (keyword prefilter + GPT-4o-mini) |
+| `services/rfq_extractor_service.py` | Pulls products/customer/company out of the email |
+| `services/rfq_matcher_service.py` | Matches extracted items against the price list (rapidfuzz + LLM pick) |
+| `services/price_lookup_service.py` | Loads `PRICE_LIST_excel/*.xlsx` into an in-memory index at startup |
+| `services/quotation_client.py` | Calls the Quotation App's `POST /api/quotations/generate` |
+| `services/gmail_service.py` | Single-account Gmail OAuth client (shared RFQ inbox) |
+| `scripts/create_oscar_bot.py` | One-time script: provisions the "Oscar AI" user account |
+| `scripts/remove_oscar_bot_membership.py` | Removes that account from all teams (it's server-side, not a real team member) |
+| `scripts/gmail_oauth_bootstrap.py` | Mints the Gmail refresh token these services need |
+| `PRICE_LIST_excel/*.xlsx` | The actual company price lists `price_lookup_service.py` reads |
+
+⚠️ **NOT currently runnable standalone.** `email_processing_service.py` imports Oscar-core services
+(`item_service`, `comment_service`, `notification_service`) that only exist inside the Oscar backend's own
+Python path — those aren't in this repo. To bring the DM bot back to life here, one of two things has to
+happen first:
+
+1. **Rewire it to call Oscar's `/internal/*` API** (the same pattern `rfq_service/oscar_client.py` in this
+   repo already uses for the background worker) instead of importing `item_service`/`comment_service`
+   directly — i.e. make `email_processing_service.py`'s task-creation step an HTTP call, not a local import.
+2. Or run it co-located with a copy of the Oscar backend's `models`/`services` package on the Python path
+   (not recommended — reintroduces the tight coupling this move was meant to remove).
+
+**Automatic assignment behavior** (unchanged from when it lived in Oscar): every quotation this pipeline
+creates is auto-assigned to **the team lead** of whichever team the asking user belongs to
+(`resolve_team_lead` in `email_processing_service.py`) — not to the asker, and not to a fixed person. A task
+carrying the quotation link is created and assigned the same way. If the asker has no team, it falls back to
+`RFQ_TEAM_LEAD_USER_ID`, then the owner of `RFQ_ORG_TEAM_ID`.
+
+**Config this path needs** (same names as `rfq_service/`'s own env vars — see that folder's `.env.example`):
+`GMAIL_*` (OAuth creds for the shared inbox), `OPENAI_API_KEY`, `QUOTATION_API_URL` /
+`QUOTATION_FRONTEND_URL`, `RFQ_TEAM_LEAD_USER_ID`, `RFQ_ORG_TEAM_ID`, `RFQ_TASK_DUE_MINUTES` /
+`RFQ_TASK_DUE_HOURS`, `OSCAR_AI_BOT_ID` (the provisioned bot account's user id in Oscar's own database).
+
+**As of this move, the "Oscar AI" DM feature is OFF inside the live Oscar app** — the code that triggered it
+(`main.py`'s DM-interception hook) has been removed there. Reviving it means finishing option 1 or 2 above,
+then re-adding an equivalent trigger wherever DMs are handled going forward.
 
 ## Tools
 Purpose is **conversational intelligence** — let an agent answer natural-language
